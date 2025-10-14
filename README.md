@@ -3,7 +3,7 @@
 This script tries every permutation of A-Z and 0-9 through a DNS server. Please note the following limitations:
 
 - Only A records are tried
-- It is rather slow, even in rust, as the runtime increases times 37 for each character in the subdomain permutation
+- It is rather slow, even in rust, as the runtime increases times 37 for each character in the subdomain permutation. I have also only gotten up to 3.8 Gbps with 10 processes.
 - The DNS server may at any time decide it is being attacked
 - It requires at least 3 threads per process (this is not normally an issue)
 - It does not exit after completing enumeration, and must be manually killed
