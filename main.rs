@@ -41,37 +41,43 @@ async fn socket_listener(
     Ok(())
 }
 
-#[tokio::main(worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let binding = vec!["0.0.0.0:", "0"];
-
-    let socket = UdpSocket::bind(binding.concat()).await?;
-    socket.connect("127.0.0.1:53").await?;
-    let arc_socket = Arc::new(socket);
-    let cloned_socket = Arc::clone(&arc_socket);
+    let sock_amt = 50;
     let args: Vec<String> = env::args().collect();
     let sparsity = args[1].parse::<u8>().unwrap() as u32;
     let offset = args[2].parse::<u8>().unwrap() as u32;
     let domains: u32 = 36u32.pow(args[3].parse::<u32>().unwrap());
-    let handle = tokio::spawn(async move {
-        let _ = socket_listener(domains, cloned_socket).await;
-    });
+    let mut sockets = Vec::new();
+    let mut socket_handles = JoinSet::new();
+    for _ in 0..sock_amt {
+        let socket = UdpSocket::bind(binding.concat()).await?;
+        socket.connect("127.0.0.1:53").await?;
+        let arc_socket = Arc::new(socket);
+        let cloned_socket = Arc::clone(&arc_socket);
+        sockets.push(arc_socket);
+        let _ = socket_handles.spawn(async move {
+            let _ = socket_listener(domains / (sparsity * offset), cloned_socket).await;
+        });
+    }
     let mut lookups = JoinSet::new();
+    let collect: u32 = 10_u32.pow(5) * sparsity;
     for i in 0..domains {
         if (i + offset) % sparsity != 0 {
             continue;
-        } else if (i + offset) % (sparsity * 10_u32.pow(5)) != 0 {
+        } else if (i + offset) % collect != 0 {
             lookups.join_all().await;
             lookups = JoinSet::new();
         }
         // println!("- {}", i);
-        let cloned_socket = Arc::clone(&arc_socket);
+        let cloned_socket = Arc::clone(&sockets[((i / sparsity) % sock_amt) as usize]);
         lookups.spawn(async move {
             let _ = lookup(i, cloned_socket).await;
         });
         // println!("{:?}", radix_change(i));
     }
     // let _ = lookups.join_all().await;
-    let _ = handle.await?;
+    let _ = socket_handles.join_all().await;
     Ok(())
 }
