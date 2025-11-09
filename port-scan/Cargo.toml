@@ -1,0 +1,11 @@
+[package]
+name = "meower"
+version = "0.1.0"
+edition = "2025"
+
+[dependencies]
+async-port-scanner = "0.1.4"
+async-std = "1.13.2"
+futures = "0.3.31"
+rlimit = "0.10.2"
+tokio = { version = "1", features = ["full"] }
