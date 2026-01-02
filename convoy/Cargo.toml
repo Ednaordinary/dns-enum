@@ -1,0 +1,11 @@
+[package]
+name = "convoy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cidr-utils = "0.6.2"
+libc = "0.2.178"
+pnet = "0.35.0"
+pnet_macros_support = "0.35.0"
+rand = "0.9.2"
