@@ -2,15 +2,16 @@ extern crate pnet;
 
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
-use pnet::datalink::{self, DataLinkReceiver, NetworkInterface};
-use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
-use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::tcp::TcpFlags::SYN;
-use pnet::packet::tcp::TcpOption;
-use pnet::packet::tcp::{MutableTcpPacket, TcpPacket};
-use pnet::packet::{MutablePacket, Packet};
+use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
+use pnet::packet::{
+    MutablePacket, Packet,
+    ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
+    ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
+    ipv4::{Ipv4Packet, MutableIpv4Packet},
+    tcp::{MutableTcpPacket, TcpFlags::SYN, TcpOption, TcpPacket},
+};
 use pnet::transport::{TransportReceiver, TransportSender, ipv4_packet_iter, transport_channel};
-use pnet::util::checksum;
+use pnet::util::{MacAddr, checksum};
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
@@ -22,22 +23,39 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
 
-fn recv(mut rx: TransportReceiver) {
-    let mut rx_iter = ipv4_packet_iter(&mut rx);
+mod socket;
 
+fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>) {
     loop {
-        match rx_iter.next() {
+        match rx.next() {
             Ok(packet) => {
-                let (packet, addr) = packet;
-                let tcp_packet: TcpPacket = TcpPacket::new(packet.payload()).unwrap();
-                println!(
-                    "Incoming {0}:{2}->{1} - {3} {4}",
-                    addr.to_string(),
-                    tcp_packet.get_source().to_string(),
-                    tcp_packet.get_destination().to_string(),
-                    packet.get_next_level_protocol().to_string(),
-                    packet.get_flags().to_string(),
-                );
+                let packet_vec: Vec<u8>;
+                match mac.is_some() {
+                    true => {
+                        let eth = EthernetPacket::new(packet).unwrap();
+                        packet_vec = eth.payload().to_vec();
+                    }
+                    false => {
+                        packet_vec = packet.to_vec();
+                    }
+                }
+                let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
+                match ip_packet.get_next_level_protocol() {
+                    IpNextHeaderProtocols::Tcp => {
+                        let tcp_packet: TcpPacket = TcpPacket::new(&packet_vec).unwrap();
+                        println!(
+                            "Tcp {0}:{1} -> {2}:{3} - {4}",
+                            ip_packet.get_source(),
+                            tcp_packet.get_source().to_string(),
+                            ip_packet.get_destination().to_string(),
+                            tcp_packet.get_destination().to_string(),
+                            tcp_packet.get_flags().to_string(),
+                        );
+                    }
+                    packet_type => {
+                        println!("Received {} packet", packet_type.to_string());
+                    }
+                }
             }
             Err(e) => {
                 println!("Error while receiving packet: {}", e)
@@ -102,7 +120,7 @@ fn send_packets(
     remote_ips: &Vec<Ipv4Cidr>,
     source_port: u16,
     remote_ports: Vec<u16>,
-    mut tx: TransportSender,
+    mut tx: socket::RawSocket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut packets = 0u64;
     let mut packets_size = 0u64;
@@ -142,12 +160,13 @@ fn send_packets(
                 dyn_sum += sum_be_words(base_packet.packet(), 8);
                 base_packet.set_checksum(finalize_checksum(dyn_sum));
 
-                println!("sending packet");
-                println!("{:02x?}", packet.packet());
-                println!("{}", ip);
+                //println!("sending packet");
+                //println!("{:02x?}", packet.packet());
+                //println!("{}", ip);
                 packets += 1;
                 packets_size += packet.packet().len() as u64;
-                tx.send_to(&packet, std::net::IpAddr::V4(ip)).unwrap();
+                //tx.send_to(&packet, std::net::IpAddr::V4(ip)).unwrap();
+                //tx.send_blocking(&packet.packet());
             }
         }
     }
@@ -164,36 +183,43 @@ fn calculate_ips(ranges: Vec<String>) -> Vec<Ipv4Cidr> {
     ips
 }
 
-fn craft_transport() -> (TransportSender, TransportReceiver) {
-    transport_channel(
-        4096,
-        pnet::transport::TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
-    )
-    .expect("Failed to create transport")
+fn craft_transport(
+    interface: &NetworkInterface,
+) -> (Box<dyn DataLinkSender>, Box<dyn DataLinkReceiver>) {
+    let mut config = datalink::Config::default();
+    config.read_timeout = Some(Duration::from_secs(1));
+    match datalink::channel(interface, config) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Bad channel type"),
+        Err(e) => panic!("Error: {}", e),
+    }
 }
 
 fn main() {
-    let (tx, rx) = craft_transport();
     let range = env::args().nth(1).unwrap();
     let mut ranges: Vec<String> = Vec::new();
     ranges.push(range);
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
-    std::thread::spawn(|| {
-        recv(rx);
-    });
-    std::thread::sleep(Duration::from_millis(1000));
-    (20..25).for_each(|x| ports.push(x));
+    (20..21).for_each(|x| ports.push(x));
     let ifs = interfaces();
     let interface = ifs
         .iter()
         .find(|e| e.is_up() && !e.is_loopback() && !e.ips.is_empty())
         .unwrap();
+    let (_, rx) = craft_transport(interface);
+    let mac: Option<MacAddr> = interface.mac;
+    std::thread::spawn(move || {
+        recv(rx, mac);
+    });
+    let tx = socket::RawSocket::new(&interface.name).unwrap();
     let ip = interface.ips.first().unwrap().ip();
+    println!("if: {}", interface.name);
+    // let ip: IpAddr = IpAddr::from(Ipv4Addr::new(0, 0, 0, 0));
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
-            let _ = send_packets(&v4_addr, &ips, 0, ports, tx);
+            let _ = send_packets(&v4_addr, &ips, 23456, ports, tx);
         }
         IpAddr::V6(v6_addr) => {
             println!("Source is v6!");
