@@ -3,6 +3,7 @@ extern crate pnet;
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
+use pnet::packet::ethernet::EtherType;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -64,6 +65,18 @@ fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>) {
     }
 }
 
+fn craft_eth_packet<'a>(
+    source: MacAddr,
+    dest: MacAddr,
+    buffer: &'a mut [u8],
+) -> MutableEthernetPacket<'a> {
+    let mut eth_packet = MutableEthernetPacket::new(buffer).unwrap();
+    eth_packet.set_source(source);
+    eth_packet.set_destination(dest);
+    eth_packet.set_ethertype(EtherTypes::Ipv4);
+    eth_packet
+}
+
 fn craft_ip_packet<'a>(source_ip: Ipv4Addr, buffer: &'a mut [u8]) -> MutableIpv4Packet<'a> {
     let mut ip_packet = MutableIpv4Packet::new(buffer).unwrap();
     ip_packet.set_version(4);
@@ -120,53 +133,67 @@ fn send_packets(
     remote_ips: &Vec<Ipv4Cidr>,
     source_port: u16,
     remote_ports: Vec<u16>,
+    gate_mac: MacAddr,
+    mac: Option<MacAddr>,
     mut tx: socket::RawSocket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut packets = 0u64;
     let mut packets_size = 0u64;
+    let mut eth_buffer = [0; 14];
+    let eth_packet;
+    let eth_packet_buff: &[u8];
+    match mac {
+        Some(mac) => {
+            eth_packet = craft_eth_packet(mac, gate_mac, &mut eth_buffer);
+            eth_packet_buff = eth_packet.packet();
+        }
+        None => {
+            eth_packet_buff = &[0; 0];
+        }
+    }
     for remote_port in remote_ports {
+        let mut ip_buffer = [0; 40];
+        let tcp_seq = rand::random::<u32>();
+        let mut ip_packet = craft_ip_packet(*source_ip, &mut ip_buffer);
+        //let mut base_packet = craft_base_packet(source_port, remote_port, ip_packet.payload_mut(), tcp_seq)?;
+        {
+            let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+            base_packet.set_source(source_port);
+            base_packet.set_destination(remote_port);
+            base_packet.set_sequence(tcp_seq);
+            base_packet.set_window(64240);
+            base_packet.set_data_offset(8);
+            base_packet.set_flags(SYN);
+            base_packet.set_data_offset(5);
+        }
+        let mut packet = MutableIpv4Packet::from(ip_packet);
+        let mut unfinished_sum = 0u32;
+        let mut dyn_sum: u32;
+        unfinished_sum += ipv4_word_sum(source_ip);
+        let protocol = IpNextHeaderProtocols::Tcp;
+        let IpNextHeaderProtocol(protocol) = protocol;
+        unfinished_sum += protocol as u32;
+        unfinished_sum += 20; // data.len()
         for ip_set in remote_ips {
-            let mut ip_buffer = [0; 40];
-            let tcp_seq = rand::random::<u32>();
-            let mut ip_packet = craft_ip_packet(*source_ip, &mut ip_buffer);
-            //let mut base_packet = craft_base_packet(source_port, remote_port, ip_packet.payload_mut(), tcp_seq)?;
-            {
-                let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
-                base_packet.set_source(source_port);
-                base_packet.set_destination(remote_port);
-                base_packet.set_sequence(tcp_seq);
-                base_packet.set_window(64240);
-                base_packet.set_data_offset(8);
-                base_packet.set_flags(SYN);
-                base_packet.set_data_offset(5);
-            }
-            let mut packet = MutableIpv4Packet::from(ip_packet);
-            let mut unfinished_sum = 0u32;
-            let mut dyn_sum: u32;
-            unfinished_sum += ipv4_word_sum(source_ip);
-            let protocol = IpNextHeaderProtocols::Tcp;
-            let IpNextHeaderProtocol(protocol) = protocol;
-            unfinished_sum += protocol as u32;
-            unfinished_sum += 20; // data.len()
             for ip in ip_set.iter().addresses() {
                 //let mut packet = MutableIpv4Packet::from(ip_packet);
                 packet.set_destination(ip);
                 //let mut packet = craft_dest_packet(&ip, &mut buffer, &base_packet, unfinished_sum);
-                let immut_ip = packet.to_immutable();
-                packet.set_checksum(checksum(immut_ip.packet(), 5));
+                //let immut_ip = packet.to_immutable();
+                packet.set_checksum(checksum(packet.packet(), 5));
                 let mut base_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
                 dyn_sum = unfinished_sum;
                 dyn_sum += ipv4_word_sum(&ip);
                 dyn_sum += sum_be_words(base_packet.packet(), 8);
                 base_packet.set_checksum(finalize_checksum(dyn_sum));
-
                 //println!("sending packet");
-                //println!("{:02x?}", packet.packet());
+                //println!("{:02x?}", [eth_packet_buff, packet.packet()].concat());
                 //println!("{}", ip);
                 packets += 1;
                 packets_size += packet.packet().len() as u64;
+                packets_size += eth_packet_buff.len() as u64;
                 //tx.send_to(&packet, std::net::IpAddr::V4(ip)).unwrap();
-                //tx.send_blocking(&packet.packet());
+                //tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
             }
         }
     }
@@ -201,17 +228,17 @@ fn main() {
     ranges.push(range);
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
-    (20..21).for_each(|x| ports.push(x));
+    (21..22).for_each(|x| ports.push(x));
     let ifs = interfaces();
-    let interface = ifs
-        .iter()
-        .find(|e| e.is_up() && !e.is_loopback() && !e.ips.is_empty())
-        .unwrap();
-    let (_, rx) = craft_transport(interface);
+    let if_default = default_net::get_default_interface().unwrap();
+    let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
+    let gate = default_net::get_default_gateway().unwrap();
+    let (_, rx) = craft_transport(&interface);
     let mac: Option<MacAddr> = interface.mac;
     std::thread::spawn(move || {
         recv(rx, mac);
     });
+    let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
     let tx = socket::RawSocket::new(&interface.name).unwrap();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
@@ -219,7 +246,7 @@ fn main() {
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
-            let _ = send_packets(&v4_addr, &ips, 23456, ports, tx);
+            let _ = send_packets(&v4_addr, &ips, 23456, ports, gate_mac, mac, tx);
         }
         IpAddr::V6(v6_addr) => {
             println!("Source is v6!");
