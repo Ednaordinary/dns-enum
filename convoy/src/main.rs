@@ -26,7 +26,7 @@ use std::time::Duration;
 
 mod socket;
 
-fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>) {
+fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>, ranges: Vec<Ipv4Cidr>) {
     loop {
         match rx.next() {
             Ok(packet) => {
@@ -41,20 +41,27 @@ fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>) {
                     }
                 }
                 let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
-                match ip_packet.get_next_level_protocol() {
-                    IpNextHeaderProtocols::Tcp => {
-                        let tcp_packet: TcpPacket = TcpPacket::new(&packet_vec).unwrap();
-                        println!(
-                            "Tcp {0}:{1} -> {2}:{3} - {4}",
-                            ip_packet.get_source(),
-                            tcp_packet.get_source().to_string(),
-                            ip_packet.get_destination().to_string(),
-                            tcp_packet.get_destination().to_string(),
-                            tcp_packet.get_flags().to_string(),
-                        );
-                    }
-                    packet_type => {
-                        println!("Received {} packet", packet_type.to_string());
+                let source = ip_packet.get_source();
+                for range in ranges.clone() {
+                    if range.contains(&source) {
+                        match ip_packet.get_next_level_protocol() {
+                            IpNextHeaderProtocols::Tcp => {
+                                let tcp_packet: TcpPacket =
+                                    TcpPacket::new(ip_packet.payload()).unwrap();
+                                println!(
+                                    "Tcp {0}:{1} -> {2}:{3} - {4}",
+                                    ip_packet.get_source(),
+                                    tcp_packet.get_source().to_string(),
+                                    ip_packet.get_destination().to_string(),
+                                    tcp_packet.get_destination().to_string(),
+                                    tcp_packet.get_flags().to_string(),
+                                );
+                            }
+                            packet_type => {
+                                //println!("Received {} packet", packet_type.to_string());
+                            }
+                        }
+                        continue;
                     }
                 }
             }
@@ -85,6 +92,10 @@ fn craft_ip_packet<'a>(source_ip: Ipv4Addr, buffer: &'a mut [u8]) -> MutableIpv4
     ip_packet.set_total_length(40);
     ip_packet.set_ttl(64);
     ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+    ip_packet.set_identification(1);
+    ip_packet.set_flags(0b010);
+    ip_packet.set_dscp(0);
+    ip_packet.set_ecn(0);
     ip_packet
 }
 
@@ -162,9 +173,10 @@ fn send_packets(
             base_packet.set_destination(remote_port);
             base_packet.set_sequence(tcp_seq);
             base_packet.set_window(64240);
-            base_packet.set_data_offset(8);
             base_packet.set_flags(SYN);
             base_packet.set_data_offset(5);
+            base_packet.set_reserved(0);
+            base_packet.set_urgent_ptr(0);
         }
         let mut packet = MutableIpv4Packet::from(ip_packet);
         let mut unfinished_sum = 0u32;
@@ -180,7 +192,8 @@ fn send_packets(
                 packet.set_destination(ip);
                 //let mut packet = craft_dest_packet(&ip, &mut buffer, &base_packet, unfinished_sum);
                 //let immut_ip = packet.to_immutable();
-                packet.set_checksum(checksum(packet.packet(), 5));
+                //packet.set_checksum(checksum(packet.packet(), 5));
+                packet.set_checksum(pnet::packet::ipv4::checksum(&packet.to_immutable()));
                 let mut base_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
                 dyn_sum = unfinished_sum;
                 dyn_sum += ipv4_word_sum(&ip);
@@ -193,7 +206,7 @@ fn send_packets(
                 packets_size += packet.packet().len() as u64;
                 packets_size += eth_packet_buff.len() as u64;
                 //tx.send_to(&packet, std::net::IpAddr::V4(ip)).unwrap();
-                //tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
+                tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
             }
         }
     }
@@ -223,20 +236,24 @@ fn craft_transport(
 }
 
 fn main() {
+    //std::thread::sleep(Duration::from_secs(1));
     let range = env::args().nth(1).unwrap();
+    let scan_port = env::args().nth(2).unwrap().parse::<u16>().unwrap();
     let mut ranges: Vec<String> = Vec::new();
     ranges.push(range);
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
-    (21..22).for_each(|x| ports.push(x));
+    ports.push(scan_port);
+    //(22..23).for_each(|x| ports.push(x));
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
     let gate = default_net::get_default_gateway().unwrap();
     let (_, rx) = craft_transport(&interface);
     let mac: Option<MacAddr> = interface.mac;
+    let ips_clone = ips.clone();
     std::thread::spawn(move || {
-        recv(rx, mac);
+        recv(rx, mac, ips_clone);
     });
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
     let tx = socket::RawSocket::new(&interface.name).unwrap();
