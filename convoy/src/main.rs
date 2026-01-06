@@ -16,10 +16,14 @@ use pnet::util::{MacAddr, checksum};
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
+use xsk_rs::config::{SocketConfig, UmemConfig};
+use xsk_rs::umem::frame::Cursor;
+use xsk_rs::{FrameDesc, Socket, TxQueue, Umem};
 
 use std::any::Any;
 use std::env;
 use std::hash::Hash;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -146,7 +150,9 @@ fn send_packets(
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
     mac: Option<MacAddr>,
-    mut tx: socket::RawSocket,
+    tx_umem: Umem,
+    mut tx_q: TxQueue,
+    tx_descs: &mut [FrameDesc],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut packets = 0u64;
     let mut packets_size = 0u64;
@@ -206,7 +212,15 @@ fn send_packets(
                 packets_size += packet.packet().len() as u64;
                 packets_size += eth_packet_buff.len() as u64;
                 //tx.send_to(&packet, std::net::IpAddr::V4(ip)).unwrap();
-                tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
+                //tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
+                unsafe {
+                    tx_umem
+                        .data_mut(&mut tx_descs[0])
+                        .cursor()
+                        .write_all(&[eth_packet_buff, packet.packet()].concat())
+                        .expect("Could not write packet");
+                    tx_q.produce_and_wakeup(&tx_descs[..1]).unwrap();
+                }
             }
         }
     }
@@ -256,14 +270,35 @@ fn main() {
         recv(rx, mac, ips_clone);
     });
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
-    let tx = socket::RawSocket::new(&interface.name).unwrap();
+    //let tx = socket::RawSocket::new(&interface.name).unwrap();
+    let (tx_umem, mut tx_descs) = Umem::new(UmemConfig::default(), 32.try_into().unwrap(), false)
+        .expect("Could not create UMEM");
+    let (tx_q, _rx_q, _tx_fq_cq) = unsafe {
+        Socket::new(
+            SocketConfig::default(),
+            &tx_umem,
+            &interface.name.parse().unwrap(),
+            0,
+        )
+    }
+    .expect("Failed tx creation");
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     // let ip: IpAddr = IpAddr::from(Ipv4Addr::new(0, 0, 0, 0));
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
-            let _ = send_packets(&v4_addr, &ips, 23456, ports, gate_mac, mac, tx);
+            let _ = send_packets(
+                &v4_addr,
+                &ips,
+                23456,
+                ports,
+                gate_mac,
+                mac,
+                tx_umem,
+                tx_q,
+                &mut tx_descs,
+            );
         }
         IpAddr::V6(v6_addr) => {
             println!("Source is v6!");
