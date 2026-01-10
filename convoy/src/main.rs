@@ -3,32 +3,25 @@ extern crate pnet;
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
-use pnet::packet::ethernet::EtherType;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
     ip::{IpNextHeaderProtocol, IpNextHeaderProtocols},
     ipv4::{Ipv4Packet, MutableIpv4Packet},
-    tcp::{MutableTcpPacket, TcpFlags::SYN, TcpOption, TcpPacket},
+    tcp::{MutableTcpPacket, TcpFlags::SYN, TcpPacket},
 };
-use pnet::transport::{TransportReceiver, TransportSender, ipv4_packet_iter, transport_channel};
-use pnet::util::{MacAddr, checksum};
+use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
-use xsk_rs::config::{SocketConfig, UmemConfig};
-use xsk_rs::umem::frame::Cursor;
-use xsk_rs::{FrameDesc, Socket, TxQueue, Umem};
+use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig};
+use xsk_rs::{CompQueue, FrameDesc, Socket, TxQueue, Umem};
 
-use std::any::Any;
 use std::env;
-use std::hash::Hash;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
-
-mod socket;
 
 fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>, ranges: Vec<Ipv4Cidr>) {
     loop {
@@ -152,10 +145,12 @@ fn send_packets(
     mac: Option<MacAddr>,
     tx_umem: Umem,
     mut tx_q: TxQueue,
+    mut cq: CompQueue,
     tx_descs: &mut [FrameDesc],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut packets = 0u64;
     let mut packets_size = 0u64;
+    let mut packet_batch_size: u16 = 64;
     let mut eth_buffer = [0; 14];
     let eth_packet;
     let eth_packet_buff: &[u8];
@@ -169,6 +164,7 @@ fn send_packets(
         }
     }
     for remote_port in remote_ports {
+        println!("Now scanning port {}", remote_port);
         let mut ip_buffer = [0; 40];
         let tcp_seq = rand::random::<u32>();
         let mut ip_packet = craft_ip_packet(*source_ip, &mut ip_buffer);
@@ -193,7 +189,8 @@ fn send_packets(
         unfinished_sum += protocol as u32;
         unfinished_sum += 20; // data.len()
         for ip_set in remote_ips {
-            for ip in ip_set.iter().addresses() {
+            for (idx, ip) in ip_set.iter().addresses().enumerate() {
+                // println!("idx {}", idx);
                 //let mut packet = MutableIpv4Packet::from(ip_packet);
                 packet.set_destination(ip);
                 //let mut packet = craft_dest_packet(&ip, &mut buffer, &base_packet, unfinished_sum);
@@ -205,9 +202,9 @@ fn send_packets(
                 dyn_sum += ipv4_word_sum(&ip);
                 dyn_sum += sum_be_words(base_packet.packet(), 8);
                 base_packet.set_checksum(finalize_checksum(dyn_sum));
-                //println!("sending packet");
-                //println!("{:02x?}", [eth_packet_buff, packet.packet()].concat());
-                //println!("{}", ip);
+                // println!("sending packet");
+                // println!("{:02x?}", [eth_packet_buff, packet.packet()].concat());
+                // println!("{}", ip);
                 packets += 1;
                 packets_size += packet.packet().len() as u64;
                 packets_size += eth_packet_buff.len() as u64;
@@ -215,12 +212,74 @@ fn send_packets(
                 //tx.send_blocking(&[eth_packet_buff, packet.packet()].concat());
                 unsafe {
                     tx_umem
-                        .data_mut(&mut tx_descs[0])
+                        .data_mut(&mut tx_descs[idx % packet_batch_size as usize])
                         .cursor()
                         .write_all(&[eth_packet_buff, packet.packet()].concat())
                         .expect("Could not write packet");
-                    tx_q.produce_and_wakeup(&tx_descs[..1]).unwrap();
+                    //tx_q.produce_and_wakeup(&tx_descs[..1]).unwrap();
+                    //println!("Wrote packet");
+                    //tx_q.produce(&tx_descs[..packet_batch_size as usize]);
                 }
+                if ((idx as u16) % packet_batch_size) == 0 && idx != 0 {
+                    unsafe {
+                        while !tx_q.poll(100).unwrap() {
+                            println!("poll failed");
+                            if tx_q.needs_wakeup() {
+                                tx_q.wakeup();
+                            }
+                            // break;
+                        }
+                        tx_q.produce_and_wakeup(&tx_descs[..packet_batch_size as usize]);
+                        let mut fr_recv = 0;
+                        while fr_recv < packet_batch_size / 2 {
+                            fr_recv += cq.consume(&mut tx_descs[..]) as u16;
+                            // println!("consumed {}", fr_recv);
+                            if fr_recv == 0 {
+                                if tx_q.needs_wakeup() {
+                                    tx_q.wakeup().unwrap();
+                                }
+                            }
+                        }
+                        // println!("finished consumption");
+                        //let fr_send = cmp::min(fr_recv, packet_batch_size);
+                        //println!("send {}", fr_send);
+                        //while {
+                        //    tx_q.produce_and_wakeup(&tx_descs[..fr_send as usize])
+                        //        .unwrap()
+                        //} != fr_send as usize
+                        //{}
+                    }
+                }
+            }
+        }
+        // this is not the correct way to calculate remaining but i dont want to fix it this second lol
+        let mut remaining = (packets % packet_batch_size as u64) as u16;
+        //println!("remaining {}", remaining);
+        unsafe {
+            while remaining > 0 {
+                while !tx_q.poll(100).unwrap() {
+                    println!("poll failed");
+                    if tx_q.needs_wakeup() {
+                        tx_q.wakeup();
+                    }
+                    // break;
+                }
+                tx_q.produce_and_wakeup(&tx_descs[..remaining as usize]);
+                let mut fr_recv = 0;
+                while fr_recv == 0 {
+                    fr_recv = cq.consume(&mut tx_descs[..]);
+                    // println!("consumed {}", fr_recv);
+                    if fr_recv == 0 {
+                        if tx_q.needs_wakeup() {
+                            tx_q.wakeup().unwrap();
+                        }
+                    }
+                }
+                // println!("finished consuming");
+                // let fr_send = cmp::min(fr_recv, packet_batch_size as usize);
+                // println!("send {}", fr_send);
+                // while { tx_q.produce_and_wakeup(&tx_descs[..fr_send]).unwrap() } != fr_send {}
+                remaining -= fr_recv as u16;
             }
         }
     }
@@ -250,15 +309,15 @@ fn craft_transport(
 }
 
 fn main() {
-    //std::thread::sleep(Duration::from_secs(1));
+    //std::thread::sleep(Duration::from_secs(5));
     let range = env::args().nth(1).unwrap();
     let scan_port = env::args().nth(2).unwrap().parse::<u16>().unwrap();
     let mut ranges: Vec<String> = Vec::new();
     ranges.push(range);
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
-    ports.push(scan_port);
-    //(22..23).for_each(|x| ports.push(x));
+    //ports.push(scan_port);
+    (1..1000).for_each(|x| ports.push(x));
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
@@ -271,11 +330,13 @@ fn main() {
     });
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
     //let tx = socket::RawSocket::new(&interface.name).unwrap();
-    let (tx_umem, mut tx_descs) = Umem::new(UmemConfig::default(), 32.try_into().unwrap(), false)
+    let (tx_umem, mut tx_descs) = Umem::new(UmemConfig::default(), 64.try_into().unwrap(), false)
         .expect("Could not create UMEM");
-    let (tx_q, _rx_q, _tx_fq_cq) = unsafe {
+    let (tx_q, _rx_q, cq) = unsafe {
         Socket::new(
-            SocketConfig::default(),
+            SocketConfig::builder()
+                .tx_queue_size(QueueSize::new(4096).unwrap())
+                .build(),
             &tx_umem,
             &interface.name.parse().unwrap(),
             0,
@@ -285,6 +346,7 @@ fn main() {
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     // let ip: IpAddr = IpAddr::from(Ipv4Addr::new(0, 0, 0, 0));
+    //std::thread::sleep(Duration::from_secs(5));
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
@@ -297,6 +359,7 @@ fn main() {
                 mac,
                 tx_umem,
                 tx_q,
+                cq.unwrap().1,
                 &mut tx_descs,
             );
         }
