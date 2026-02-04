@@ -3,6 +3,8 @@ extern crate pnet;
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
+use pnet::packet::tcp::TcpFlags;
+use pnet::packet::udp::UdpPacket;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -14,7 +16,7 @@ use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
-use xsk_rs::config::{BindFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{BindFlags, FrameSize, QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FrameDesc, Socket, TxQueue, Umem};
 
 use std::env;
@@ -39,21 +41,36 @@ fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>, ranges: Vec<Ipv
                 }
                 let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
                 let source = ip_packet.get_source();
+                // println!("src {}", source);
                 for range in ranges.clone() {
                     if range.contains(&source) {
+                        println!("from: {:02X?}", packet_vec);
                         match ip_packet.get_next_level_protocol() {
                             IpNextHeaderProtocols::Tcp => {
                                 let tcp_packet: TcpPacket =
                                     TcpPacket::new(ip_packet.payload()).unwrap();
+                                if tcp_packet.get_flags() != 18 {
+                                    continue;
+                                };
                                 println!(
-                                    "Tcp {0}:{1} -> {2}:{3} - {4}",
+                                    "Tcp {0}:{1} -> {2}:{3} - SYN ACK",
                                     ip_packet.get_source(),
                                     tcp_packet.get_source().to_string(),
                                     ip_packet.get_destination().to_string(),
                                     tcp_packet.get_destination().to_string(),
-                                    tcp_packet.get_flags().to_string(),
                                 );
                             }
+                            //IpNextHeaderProtocols::Udp => {
+                            //    let udp_packet: UdpPacket =
+                            //        UdpPacket::new(ip_packet.payload()).unwrap();
+                            //    println!(
+                            //        "Udp {0}:{1} -> {2}:{3} - 4",
+                            //        ip_packet.get_source(),
+                            //        udp_packet.get_source().to_string(),
+                            //        ip_packet.get_destination().to_string(),
+                            //        udp_packet.get_destination().to_string(),
+                            //    )
+                            //}
                             _ => {}
                         }
                         continue;
@@ -165,7 +182,7 @@ fn send_packets(
         }
     }
     for remote_port in remote_ports {
-        println!("Now scanning port {}", remote_port);
+        //println!("Now scanning port {}", remote_port);
         //std::thread::sleep(std::time::Duration::from_millis(2000));
         let start_time = std::time::Instant::now();
         let mut ip_buffer = [0; 40];
@@ -193,28 +210,35 @@ fn send_packets(
         for ip_set in remote_ips {
             for ip in ip_set.iter().addresses() {
                 packet.set_destination(ip);
+
                 packet.set_checksum(pnet::packet::ipv4::checksum(&packet.to_immutable()));
                 let mut base_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
                 dyn_sum = unfinished_sum;
                 dyn_sum += ipv4_word_sum(&ip);
                 dyn_sum += sum_be_words(base_packet.packet(), 8);
                 base_packet.set_checksum(finalize_checksum(dyn_sum));
+                // base_packet.set_sequence(base_packet.get_sequence() + 1);
                 packets += 1;
                 packets_size += packet.packet().len() as u64;
                 packets_size += eth_packet_buff.len() as u64;
                 unsafe {
-                    tx_umem
-                        .data_mut(&mut tx_descs[allowed_write as usize])
-                        .cursor()
-                        .write_all(&[eth_packet_buff, packet.packet()].concat())
-                        .unwrap_or_else(|_x| {
-                            println!(
-                                "allowed_write: {}\nconsumed: {}\nlen: {}",
-                                allowed_write,
-                                consumed,
-                                tx_descs.len()
-                            )
-                        });
+                    let mut mut_data = tx_umem.data_mut(&mut tx_descs[allowed_write as usize]);
+                    let mut cursor = mut_data.cursor();
+                    // cursor.set_pos(0);
+                    let final_pack = &[eth_packet_buff, packet.packet()].concat();
+                    println!("to: {:02X?}", final_pack);
+                    cursor.write_all(final_pack).unwrap();
+                    //content_ptr[0..final_pack.len()] = final_pack;
+                    //.cursor()
+                    //.write_all(&[eth_packet_buff, packet.packet()].concat())
+                    //.unwrap_or_else(|_x| {
+                    //    println!(
+                    //        "allowed_write: {}\nconsumed: {}\nlen: {}",
+                    //        allowed_write,
+                    //        consumed,
+                    //        tx_descs.len()
+                    //    )
+                    //});
                     while !tx_q.poll(100).unwrap() {
                         println!("poll failed");
                     }
@@ -262,10 +286,11 @@ fn send_packets(
         let end_time = std::time::Instant::now();
         let time_taken = end_time - start_time;
         //std::thread::sleep(std::time::Duration::from_millis(1000));
-        println!(
-            "Packets per second (last port): {}",
-            packets as u128 * 1000000 / time_taken.as_micros()
-        );
+        //println!(
+        //    "Packets per second ({}): {}",
+        //    remote_port,
+        //    packets as u128 * 1000000 / time_taken.as_micros()
+        //);
     }
     Ok((packets, packets_size))
 }
@@ -299,7 +324,7 @@ fn main() {
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
     ports.push(scan_port);
-    //(1..50).for_each(|x| ports.push(x)); // Use this to add a range instead
+    //(20000..20100).for_each(|x| ports.push(x)); // Use this to add a range instead
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
@@ -311,13 +336,20 @@ fn main() {
         recv(rx, mac, ips_clone);
     });
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
-    let (tx_umem, mut tx_descs) =
-        Umem::new(UmemConfig::default(), tx_buffer.try_into().unwrap(), false)
-            .expect("Could not create UMEM");
+    let (tx_umem, mut tx_descs) = Umem::new(
+        UmemConfig::builder()
+            //.comp_queue_size(QueueSize::new(65536).unwrap())
+            .frame_size(FrameSize::new(2048).unwrap())
+            .build()
+            .unwrap(),
+        tx_buffer.try_into().unwrap(),
+        false,
+    )
+    .expect("Could not create UMEM");
     let (tx_q, _rx_q, cq) = unsafe {
         Socket::new(
             SocketConfig::builder()
-                .tx_queue_size(QueueSize::new(65536 * 2).unwrap())
+                .tx_queue_size(QueueSize::new(65536 * 8).unwrap())
                 .bind_flags(BindFlags::XDP_USE_NEED_WAKEUP)
                 .xdp_flags(XdpFlags::XDP_FLAGS_DRV_MODE)
                 .build(),
@@ -335,7 +367,7 @@ fn main() {
             let (packets, packets_size) = send_packets(
                 &v4_addr,
                 &ips,
-                23456,
+                34567,
                 ports,
                 gate_mac,
                 mac,
